@@ -1,1 +1,450 @@
-<p>Hello, world!</p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Immersion Viewer</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; display: flex; gap: 24px; align-items: flex-start; }
+  .panel { width: 320px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
+  th, td { border: 1px solid #ccc; padding: 4px; text-align: center; font-size: 13px; }
+  input[type=number] { width: 70px; }
+  button { margin: 2px; padding: 4px 8px; cursor: pointer; }
+  .row { margin: 8px 0; }
+  svg { border: 1px solid #888; background: #fafafa; }
+  .legend { font-size: 13px; }
+  .legend span { display: inline-block; width: 12px; height: 12px; vertical-align: middle; margin-right: 4px; border: 1px solid #333; }
+  .hint { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <h2>Figure</h2>
+  <p class="hint">Add points in clockwise order. Coordinates are in arbitrary units; up is +Y.</p>
+
+  <table id="ptsTable">
+    <thead><tr><th>#</th><th>X</th><th>Y</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="row">
+    <label>X: <input type="number" id="newX" value="0" step="0.1"></label>
+    <label>Y: <input type="number" id="newY" value="0" step="0.1"></label>
+    <button id="addBtn">Add point</button>
+  </div>
+
+  <div class="row">
+    <button id="presetBtn">Load square preset</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+
+  <div class="row">
+    <label>Rotation angle (rad):
+      <input type="number" id="angle" value="0" step="0.1">
+    </label>
+    <button id="rotateBtn">Rotate</button>
+    <div class="hint">Rotates points around the figure's centroid.</div>
+  </div>
+
+  <hr>
+
+  <div class="row">
+    <label>Density of figure (kg/m³):
+      <input type="number" id="density" value="500" min="0" step="10">
+    </label>
+  </div>
+  <div class="row">
+    <label>Density of water (kg/m³):
+      <input type="number" id="waterDensity" value="1000" min="1" step="10">
+    </label>
+  </div>
+
+  <div class="legend">
+    <div><span style="background:#3a7;"></span> Figure</div>
+    <div><span style="background:#36c;"></span> Submerged area</div>
+    <div><span style="background:#48f;opacity:.4;"></span> Water</div>
+    <div>● Center of mass &nbsp; ◆ Center of buoyancy</div>
+  </div>
+
+  <div id="info" class="hint" style="margin-top:8px;"></div>
+</div>
+
+<svg id="canvas" width="700" height="600"></svg>
+
+<script>
+"use strict";
+
+const points = []; // world coords, user-entered (clockwise, +Y up)
+
+const svg = document.getElementById('canvas');
+const W = +svg.getAttribute('width'), H = +svg.getAttribute('height');
+
+// View transform: world -> screen. We'll auto-fit.
+let view = { scale: 30, ox: W/2, oy: H/2 };
+
+function worldToScreen(p) {
+  return { x: view.ox + p.x * view.scale, y: view.oy - p.y * view.scale };
+}
+
+// --- Geometry helpers (assume polygon vertices given in some order; we work with signed area) ---
+
+// Signed area; positive if CCW (with +Y up).
+function polygonSignedArea(pts) {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i+1) % pts.length];
+    a += p.x * q.y - q.x * p.y;
+  }
+  return a / 2;
+}
+
+function polygonArea(pts) { return Math.abs(polygonSignedArea(pts)); }
+
+// Centroid of polygon (uses signed area). Works for any orientation.
+function polygonCentroid(pts) {
+  let cx = 0, cy = 0, a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i+1) % pts.length];
+    const cr = p.x * q.y - q.x * p.y;
+    a += cr;
+    cx += (p.x + q.x) * cr;
+    cy += (p.y + q.y) * cr;
+  }
+  a /= 2;
+  if (Math.abs(a) < 1e-12) return null;
+  return { x: cx / (6*a), y: cy / (6*a), area: Math.abs(a) };
+}
+
+// Clip polygon against half-plane y <= yLine (Sutherland–Hodgman).
+// Returns the part below the line (submerged).
+function clipBelow(pts, yLine) {
+  if (pts.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const cur = pts[i];
+    const prev = pts[(i - 1 + pts.length) % pts.length];
+    const curIn = cur.y <= yLine;
+    const prevIn = prev.y <= yLine;
+    if (curIn) {
+      if (!prevIn) {
+        // entering: add intersection
+        const t = (yLine - prev.y) / (cur.y - prev.y);
+        out.push({ x: prev.x + t * (cur.x - prev.x), y: yLine });
+      }
+      out.push(cur);
+    } else if (prevIn) {
+      // leaving: add intersection
+      const t = (yLine - prev.y) / (cur.y - prev.y);
+      out.push({ x: prev.x + t * (cur.x - prev.x), y: yLine });
+    }
+  }
+  return out;
+}
+
+// Find waterline y such that submerged area / total area = ratio.
+// Uses bisection on y between min and max vertex y.
+function findWaterline(pts, ratio) {
+  if (ratio <= 0) return Math.min(...pts.map(p => p.y)) - 0; // floats above (no submersion)
+  if (ratio >= 1) return Math.max(...pts.map(p => p.y));     // fully submerged
+  const totalArea = polygonArea(pts);
+  let lo = Math.min(...pts.map(p => p.y));
+  let hi = Math.max(...pts.map(p => p.y));
+  for (let iter = 0; iter < 80; iter++) {
+    const mid = (lo + hi) / 2;
+    const sub = clipBelow(pts, mid);
+    const subArea = sub.length >= 3 ? polygonArea(sub) : 0;
+    if (subArea / totalArea > ratio) hi = mid; else lo = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// --- Rendering ---
+
+function autoFit() {
+  if (points.length === 0) return;
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  let minX = Math.min(...xs), maxX = Math.max(...xs);
+  let minY = Math.min(...ys), maxY = Math.max(...ys);
+  // Always include some water below
+  const padX = Math.max(1, (maxX - minX) * 0.3);
+  const padY = Math.max(1, (maxY - minY) * 0.6);
+  minX -= padX; maxX += padX;
+  minY -= padY; maxY += padY;
+  const sx = W / (maxX - minX);
+  const sy = H / (maxY - minY);
+  view.scale = Math.min(sx, sy);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  view.ox = W/2 - cx * view.scale;
+  view.oy = H/2 + cy * view.scale;
+}
+
+function svgEl(name, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', name);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function pathFromPoints(pts) {
+  return pts.map((p, i) => {
+    const s = worldToScreen(p);
+    return (i === 0 ? 'M' : 'L') + s.x.toFixed(2) + ',' + s.y.toFixed(2);
+  }).join(' ') + ' Z';
+}
+
+function render() {
+  // clear
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  const info = document.getElementById('info');
+
+  if (points.length < 3) {
+    autoFit();
+    drawAxes(0); // arbitrary water at y=0
+    drawPoints();
+    info.textContent = 'Add at least 3 points to form a figure.';
+    return;
+  }
+
+  autoFit();
+
+  const density = parseFloat(document.getElementById('density').value) || 0;
+  const rhoW = parseFloat(document.getElementById('waterDensity').value) || 1;
+  let ratio = density / rhoW;
+  let floats = true;
+  if (ratio >= 1) { ratio = 1; floats = false; }
+  if (ratio < 0) ratio = 0;
+
+  const totalCentroid = polygonCentroid(points);
+  const totalArea = totalCentroid ? totalCentroid.area : 0;
+
+  // Position figure: place so that the waterline is y = 0 in world coords.
+  // We move the figure vertically so that submerged fraction = ratio with waterline at y=0.
+  // Strategy: compute waterline yL inside figure as-is, then shift figure by -yL.
+  let shifted = points;
+  let waterY = 0;
+  if (floats && ratio > 0 && ratio < 1) {
+    const yL = findWaterline(points, ratio);
+    shifted = points.map(p => ({ x: p.x, y: p.y - yL }));
+  } else if (!floats) {
+    // Fully submerged: place top of figure slightly below water
+    const maxY = Math.max(...points.map(p => p.y));
+    shifted = points.map(p => ({ x: p.x, y: p.y - maxY - 0.5 }));
+  } else {
+    // ratio = 0: floats entirely above water; place bottom on waterline
+    const minY = Math.min(...points.map(p => p.y));
+    shifted = points.map(p => ({ x: p.x, y: p.y - minY }));
+  }
+
+  // Recompute fit including shifted points
+  const xs = shifted.map(p => p.x);
+  const ys = shifted.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const spanX = Math.max(1, maxX - minX);
+  const spanY = Math.max(1, maxY - minY);
+  const padX = spanX * 0.4;
+  const padY = spanY * 0.6;
+  const fitMinX = minX - padX, fitMaxX = maxX + padX;
+  const fitMinY = Math.min(minY, waterY) - padY;
+  const fitMaxY = Math.max(maxY, waterY) + padY;
+  const sx = W / (fitMaxX - fitMinX);
+  const sy = H / (fitMaxY - fitMinY);
+  view.scale = Math.min(sx, sy);
+  view.ox = W/2 - ((fitMinX + fitMaxX)/2) * view.scale;
+  view.oy = H/2 + ((fitMinY + fitMaxY)/2) * view.scale;
+
+  // Draw water (rectangle from waterY downwards covering visible area)
+  const waterTop = worldToScreen({ x: 0, y: waterY }).y;
+  svg.appendChild(svgEl('rect', {
+    x: 0, y: waterTop, width: W, height: H - waterTop,
+    fill: '#48a3ff', 'fill-opacity': 0.35
+  }));
+  // Waterline
+  svg.appendChild(svgEl('line', {
+    x1: 0, y1: waterTop, x2: W, y2: waterTop,
+    stroke: '#1d6fc2', 'stroke-width': 1.5
+  }));
+
+  // Submerged polygon (below water, i.e., y <= waterY)
+  const submerged = clipBelow(shifted, waterY);
+  if (submerged.length >= 3) {
+    svg.appendChild(svgEl('path', {
+      d: pathFromPoints(submerged),
+      fill: '#3366cc', 'fill-opacity': 0.6, stroke: '#1d3f7a', 'stroke-width': 1
+    }));
+  }
+
+  // Figure outline
+  svg.appendChild(svgEl('path', {
+    d: pathFromPoints(shifted),
+    fill: '#33aa77', 'fill-opacity': 0.45,
+    stroke: '#1d6f4a', 'stroke-width': 2
+  }));
+
+  // Vertices with labels
+  shifted.forEach((p, i) => {
+    const s = worldToScreen(p);
+    svg.appendChild(svgEl('circle', { cx: s.x, cy: s.y, r: 3, fill: '#222' }));
+    const t = svgEl('text', { x: s.x + 6, y: s.y - 6, 'font-size': 11, fill: '#222' });
+    t.textContent = (i + 1);
+    svg.appendChild(t);
+  });
+
+  // Center of mass (centroid of full figure, assuming uniform density)
+  const cm = polygonCentroid(shifted);
+  if (cm) {
+    const s = worldToScreen(cm);
+    svg.appendChild(svgEl('circle', { cx: s.x, cy: s.y, r: 6, fill: '#d22', stroke: '#000', 'stroke-width': 1 }));
+    const t = svgEl('text', { x: s.x + 8, y: s.y + 4, 'font-size': 12, fill: '#900' });
+    t.textContent = 'CoM';
+    svg.appendChild(t);
+  }
+
+  // Center of buoyancy (centroid of submerged part)
+  let cb = null;
+  if (submerged.length >= 3) {
+    cb = polygonCentroid(submerged);
+    if (cb) {
+      const s = worldToScreen(cb);
+      const size = 6;
+      svg.appendChild(svgEl('polygon', {
+        points: `${s.x},${s.y-size} ${s.x+size},${s.y} ${s.x},${s.y+size} ${s.x-size},${s.y}`,
+        fill: '#fa0', stroke: '#000', 'stroke-width': 1
+      }));
+      const t = svgEl('text', { x: s.x + 8, y: s.y + 4, 'font-size': 12, fill: '#a60' });
+      t.textContent = 'CoB';
+      svg.appendChild(t);
+    }
+  }
+
+  // Info text
+  const subArea = submerged.length >= 3 ? polygonArea(submerged) : 0;
+  const actualRatio = totalArea > 0 ? subArea / totalArea : 0;
+  let status;
+  if (!floats) status = `Sinks (density ≥ water).`;
+  else if (ratio === 0) status = `Floats fully above water.`;
+  else status = `Floats. Submerged fraction: ${(actualRatio*100).toFixed(1)}%`;
+
+  info.innerHTML =
+    `Total area: ${totalArea.toFixed(3)}<br>` +
+    `Submerged area: ${subArea.toFixed(3)}<br>` +
+    `Center of mass: (${cm ? cm.x.toFixed(3) : '-'}, ${cm ? cm.y.toFixed(3) : '-'})<br>` +
+    (cb ? `Center of buoyancy: (${cb.x.toFixed(3)}, ${cb.y.toFixed(3)})<br>` : '') +
+    status;
+}
+
+function drawAxes(waterY) {
+  const waterTop = worldToScreen({ x: 0, y: waterY }).y;
+  svg.appendChild(svgEl('rect', {
+    x: 0, y: waterTop, width: W, height: H - waterTop,
+    fill: '#48a3ff', 'fill-opacity': 0.2
+  }));
+  svg.appendChild(svgEl('line', {
+    x1: 0, y1: waterTop, x2: W, y2: waterTop,
+    stroke: '#1d6fc2', 'stroke-width': 1
+  }));
+}
+
+function drawPoints() {
+  points.forEach((p, i) => {
+    const s = worldToScreen(p);
+    svg.appendChild(svgEl('circle', { cx: s.x, cy: s.y, r: 3, fill: '#222' }));
+    const t = svgEl('text', { x: s.x + 6, y: s.y - 6, 'font-size': 11, fill: '#222' });
+    t.textContent = (i + 1);
+    svg.appendChild(t);
+  });
+}
+
+// --- UI ---
+
+function refreshTable() {
+  const tbody = document.querySelector('#ptsTable tbody');
+  tbody.innerHTML = '';
+  points.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td><input type="number" step="0.1" value="${p.x}" data-idx="${i}" data-axis="x"></td>
+      <td><input type="number" step="0.1" value="${p.y}" data-idx="${i}" data-axis="y"></td>
+      <td><button data-del="${i}">×</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll('input').forEach(inp => {
+    inp.addEventListener('input', e => {
+      const i = +e.target.dataset.idx;
+      const axis = e.target.dataset.axis;
+      points[i][axis] = parseFloat(e.target.value) || 0;
+      render();
+    });
+  });
+  tbody.querySelectorAll('button[data-del]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const i = +e.target.dataset.del;
+      points.splice(i, 1);
+      refreshTable();
+      render();
+    });
+  });
+}
+
+document.getElementById('addBtn').addEventListener('click', () => {
+  const x = parseFloat(document.getElementById('newX').value) || 0;
+  const y = parseFloat(document.getElementById('newY').value) || 0;
+  points.push({ x, y });
+  refreshTable();
+  render();
+});
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  points.length = 0;
+  refreshTable();
+  render();
+});
+
+document.getElementById('presetBtn').addEventListener('click', () => {
+  points.length = 0;
+  // Square, clockwise with +Y up: top-left -> top-right -> bottom-right -> bottom-left
+  points.push({ x: -2, y:  2 });
+  points.push({ x:  2, y:  2 });
+  points.push({ x:  2, y: -2 });
+  points.push({ x: -2, y: -2 });
+  refreshTable();
+  render();
+});
+
+document.getElementById('rotateBtn').addEventListener('click', () => {
+  if (points.length < 2) return;
+  const angle = parseFloat(document.getElementById('angle').value) || 0;
+  // Rotate around centroid of the figure (or geometric mean fallback)
+  let cx = 0, cy = 0;
+  const c = points.length >= 3 ? polygonCentroid(points) : null;
+  if (c) { cx = c.x; cy = c.y; }
+  else {
+    points.forEach(p => { cx += p.x; cy += p.y; });
+    cx /= points.length; cy /= points.length;
+  }
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  for (let i = 0; i < points.length; i++) {
+    const dx = points[i].x - cx;
+    const dy = points[i].y - cy;
+    points[i] = {
+      x: +(cx + dx * cos - dy * sin).toFixed(6),
+      y: +(cy + dx * sin + dy * cos).toFixed(6)
+    };
+  }
+  refreshTable();
+  render();
+});
+
+document.getElementById('density').addEventListener('input', render);
+document.getElementById('waterDensity').addEventListener('input', render);
+
+// Start with a preset so the page is immediately useful
+document.getElementById('presetBtn').click();
+</script>
+
+</body>
+</html>
